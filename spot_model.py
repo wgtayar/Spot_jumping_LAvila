@@ -1,166 +1,136 @@
-# external/spot/spot_model.py
+# Library for constructing the Spot + ground model as a RobotDiagram.
+#
+# This is a light wrapper around Antonio Avila's `spot_jumping.py` setup,
+# but packaged as a reusable class so we can share it across scripts
+# (standing, MPC, etc.).
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Optional
 
 import numpy as np
 
 from pydrake.all import (
-    Diagram,
     DiscreteContactApproximation,
+    JointActuatorIndex,
     Meshcat,
     MeshcatVisualizer,
-    ModelInstanceIndex,
     MultibodyPlant,
+    PdControllerGains,
+    RobotDiagram,
     RobotDiagramBuilder,
     SceneGraph,
     StartMeshcat,
-)
-
-from underactuated import ConfigureParser
-
-
-# Same contact point and initial foot positions as in spot_jumping.py
-FOOT_IN_LEG = np.array([0.0, 0.0, -0.3365 - 0.036])
-INITIAL_FOOT_POSITIONS = np.array(
-    [
-        [2.20252120e-01, 1.65945000e-01, 0.0],   # front left
-        [2.20252120e-01, -1.65945000e-01, 0.0],  # front right
-        [-3.75447880e-01, 1.65945000e-01, 0.0],  # rear left
-        [-3.75447880e-01, -1.65945000e-01, 0.0], # rear right
-    ]
+    Parser,
 )
 
 
 @dataclass
-class SpotModel:
-    """Container for all useful handles related to the Spot model."""
-    diagram: Diagram
+class SpotHandles:
+    diagram: RobotDiagram
     plant: MultibodyPlant
     scene_graph: SceneGraph
-    meshcat: Optional[Meshcat]
-    visualizer: Optional[MeshcatVisualizer]
-    model_instance: ModelInstanceIndex
-
-    default_context: Diagram  # actually a Context, kept for convenience
-    default_plant_context: Diagram  # plant sub-context
-
-    default_q: np.ndarray
-
-    body_frame: object
-    foot_frames: List[object]
-    foot_in_leg: np.ndarray
-    initial_foot_positions: np.ndarray
+    model_instance: object
+    visualizer: MeshcatVisualizer
 
 
-def build_spot_robot_diagram(
-    time_step: float = 1e-4,
-    meshcat: Optional[Meshcat] = None,
-    with_visualizer: bool = True,
-    use_lagged_contact: bool = True,
-) -> SpotModel:
-    """
-    Build a MultibodyPlant + SceneGraph diagram for Spot standing on flat ground.
+class SpotModel:
+    def __init__(
+        self,
+        time_step: float = 1e-4,
+        enable_joint_pd: bool = False,
+        joint_kp: float = 200.0,
+        joint_kd: float = 20.0,
+    ) -> None:
+        self.time_step = float(time_step)
+        self.enable_joint_pd = bool(enable_joint_pd)
+        self.joint_kp = float(joint_kp)
+        self.joint_kd = float(joint_kd)
 
-    This follows the same setup as spot_jumping.py (RobotDiagramBuilder,
-    ConfigureParser, Spot + ground models, discrete contact, etc.), but wraps it
-    into a reusable function and returns a SpotModel with all the key handles.
+        self._diagram: Optional[RobotDiagram] = None
+        self._plant: Optional[MultibodyPlant] = None
+        self._scene_graph: Optional[SceneGraph] = None
+        self._model_instance: Optional[object] = None
+        self._visualizer: Optional[MeshcatVisualizer] = None
 
-    Parameters
-    ----------
-    time_step : float
-        Discrete time step for the plant (passed to RobotDiagramBuilder).
-    meshcat : Meshcat, optional
-        Existing Meshcat instance. If None and with_visualizer=True, a new one
-        is created via StartMeshcat().
-    with_visualizer : bool
-        If True, a MeshcatVisualizer is added to the diagram builder.
-    use_lagged_contact : bool
-        If True, set discrete contact approximation to kLagged.
 
-    Returns
-    -------
-    SpotModel
-        Dataclass containing diagram, plant, contexts, default pose, and frames.
-    """
+    @property
+    def diagram(self) -> RobotDiagram:
+        assert self._diagram is not None, "Call build_robot_diagram() first."
+        return self._diagram
 
-    # Start Meshcat if we want visualization and none was provided.
-    if with_visualizer and meshcat is None:
-        meshcat = StartMeshcat()
-    elif not with_visualizer:
-        meshcat = None
+    @property
+    def plant(self) -> MultibodyPlant:
+        assert self._plant is not None, "Call build_robot_diagram() first."
+        return self._plant
 
-    # Build the robot + scene_graph just like in spot_jumping.py.
-    robot_builder = RobotDiagramBuilder(time_step=time_step)
-    plant = robot_builder.plant()
-    scene_graph = robot_builder.scene_graph()
-    parser = robot_builder.parser()
+    @property
+    def scene_graph(self) -> SceneGraph:
+        assert self._scene_graph is not None, "Call build_robot_diagram() first."
+        return self._scene_graph
 
-    # Configure package paths so "package://underactuated/..." works.
-    ConfigureParser(parser)
+    @property
+    def model_instance(self):
+        assert self._model_instance is not None, "Call build_robot_diagram() first."
+        return self._model_instance
 
-    # Spot robot model and a simple ground plane.
-    (spot_instance,) = parser.AddModelsFromUrl(
-        "package://underactuated/models/spot/spot.dmd.yaml"
-    )
-    parser.AddModelsFromUrl(
-        "package://underactuated/models/littledog/ground.urdf"
-    )
+    @property
+    def visualizer(self) -> MeshcatVisualizer:
+        assert self._visualizer is not None, "Call build_robot_diagram() first."
+        return self._visualizer
 
-    if use_lagged_contact:
+    def build_robot_diagram(self, meshcat: Optional[Meshcat] = None) -> RobotDiagram:
+        # Builds the Spot & ground diagram and returns it.
+        if meshcat is None:
+            meshcat = StartMeshcat()
+
+        robot_builder = RobotDiagramBuilder(time_step=self.time_step)
+        plant = robot_builder.plant()
+        scene_graph = robot_builder.scene_graph()
+        parser: Parser = robot_builder.parser()
+
+        from underactuated import ConfigureParser
+
+        ConfigureParser(parser)
+        (spot_instance,) = parser.AddModelsFromUrl(
+            "package://underactuated/models/spot/spot.dmd.yaml"
+        )
+        parser.AddModelsFromUrl("package://underactuated/models/littledog/ground.urdf")
+
         plant.set_discrete_contact_approximation(
             DiscreteContactApproximation.kLagged
         )
 
-    # No more topology changes allowed after Finalize.
-    plant.Finalize()
+        # Optional low-level PD on each actuated joint of Spot.
+        if self.enable_joint_pd:
+            self._configure_joint_pd_gains(plant, spot_instance)
 
-    # Optionally attach a Meshcat visualizer.
-    visualizer = None
-    if with_visualizer and meshcat is not None:
+        plant.Finalize()
+
         builder = robot_builder.builder()
         visualizer = MeshcatVisualizer.AddToBuilder(
             builder, scene_graph, meshcat=meshcat
         )
 
-    # Build the final diagram and create a default context.
-    diagram = robot_builder.Build()
-    diagram_context = diagram.CreateDefaultContext()
-    plant_context = plant.GetMyContextFromRoot(diagram_context)
+        diagram = robot_builder.Build()
 
-    # Default configuration: use plant defaults, then apply same small z-offset
-    # as in spot_jumping.py so the feet sit nicely on the ground.
-    q0 = plant.GetDefaultPositions().copy()
-    # Index 6 is the base z position for this model.
-    q0[6] -= 0.02889683
-    plant.SetPositions(plant_context, q0)
+        self._diagram = diagram
+        self._plant = plant
+        self._scene_graph = scene_graph
+        self._model_instance = spot_instance
+        self._visualizer = visualizer
 
-    # Publish once so that, if Meshcat is attached, we see the initial pose.
-    diagram.ForcedPublish(diagram_context)
+        return diagram
 
-    # Useful frames.
-    body_frame = plant.GetFrameByName("body", spot_instance)
-    foot_frames = [
-        plant.GetFrameByName("front_left_lower_leg", spot_instance),
-        plant.GetFrameByName("front_right_lower_leg", spot_instance),
-        plant.GetFrameByName("rear_left_lower_leg", spot_instance),
-        plant.GetFrameByName("rear_right_lower_leg", spot_instance),
-    ]
+    def _configure_joint_pd_gains(self, plant: MultibodyPlant, model_instance) -> None:
+        # Enable simple low-level PD on every joint actuator in model_instance.
+        num_actuators_total = plant.num_actuators()
 
-    return SpotModel(
-        diagram=diagram,
-        plant=plant,
-        scene_graph=scene_graph,
-        meshcat=meshcat,
-        visualizer=visualizer,
-        model_instance=spot_instance,
-        default_context=diagram_context,
-        default_plant_context=plant_context,
-        default_q=q0,
-        body_frame=body_frame,
-        foot_frames=foot_frames,
-        foot_in_leg=FOOT_IN_LEG.copy(),
-        initial_foot_positions=INITIAL_FOOT_POSITIONS.copy(),
-    )
+        for i in range(num_actuators_total):
+            actuator = plant.get_joint_actuator(JointActuatorIndex(i))
+            if actuator.model_instance() != model_instance:
+                # Skip actuators that belong to other models (for example spot's floating base's actuators).
+                continue
+            gains = PdControllerGains(p=self.joint_kp, d=self.joint_kd)
+            actuator.set_controller_gains(gains)
