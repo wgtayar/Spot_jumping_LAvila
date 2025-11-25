@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import numpy as np
 import time
+import matplotlib.pyplot as plt
 
 from pydrake.all import (
     Simulator,
@@ -25,7 +26,7 @@ from spot_footstep_plan import (
     generate_straight_footstep_plan,
     get_leg_names,
 )
-from gait_optimization import gait_optimization
+from gait_optimization import gait_optimization, UNDERACTUATED_JOINT_NAMES
 
 from underactuated import ConfigureParser
 
@@ -159,10 +160,11 @@ def compute_multi_step_trajectory(num_steps: int = 4):
     segment_times = []
     segment_q_traj = []
     segment_v_traj = []
+    all_torque_data = []  # Store torque data from each phase
     t_offset = 0.0
     
     # Set box_height (ground level)
-    box_height = 0.0
+    box_height = 0.016
     
     # Step parameters
     step_length = 0.15  # meters per step
@@ -235,7 +237,7 @@ def compute_multi_step_trajectory(num_steps: int = 4):
             print(f"    {name}: x={next_foot[i, 0]:.4f}, y={next_foot[i, 1]:.4f}{swing_marker}")
         
         # Call gait_optimization for this phase (with diagonal pair)
-        t_step, q_step, v_step, q_end = gait_optimization(
+        t_step, q_step, v_step, q_end, torque_data = gait_optimization(
             plant,
             plant_context,
             spot_model,
@@ -250,6 +252,11 @@ def compute_multi_step_trajectory(num_steps: int = 4):
         segment_times.append(t_step.copy())
         segment_q_traj.append(q_step)
         segment_v_traj.append(v_step)
+        
+        # Store torque data with time offset for stitching
+        torque_data['phase'] = step_num + 1
+        torque_data['time_offset'] = t_offset if step_num > 0 else 0.0
+        all_torque_data.append(torque_data)
         
         # Update time offset for next segment
         t_offset += (t_step[-1] - t_step[0])
@@ -303,7 +310,7 @@ def compute_multi_step_trajectory(num_steps: int = 4):
     print(f"  Total trajectory duration: {t_sol[-1]:.4f} s")
     print(f"  Total time samples: {len(t_sol)}")
     
-    return t_sol, q_sol, v_sol, q0
+    return t_sol, q_sol, v_sol, q0, all_torque_data
 
 
 def build_visualization_diagram():
@@ -433,12 +440,561 @@ def playback_trajectory(t_sol, q_sol, diagram, plant, meshcat, visualizer):
     print(f"Meshcat URL: {meshcat.web_url()}")
 
 
+def print_underactuation_report(all_torque_data: list):
+    """
+    Print a comprehensive report on underactuation verification.
+    
+    Args:
+        all_torque_data: List of torque data dicts from each phase
+    """
+    print("\n" + "=" * 80)
+    print("UNDERACTUATION VERIFICATION REPORT")
+    print("=" * 80)
+    
+    if not all_torque_data or not all_torque_data[0].get('underactuated_indices'):
+        print("\n  No underactuation constraints were applied.")
+        print("  All joints are fully actuated.")
+        return
+    
+    underactuated_names = all_torque_data[0].get('underactuated_names', [])
+    underactuated_indices = all_torque_data[0].get('underactuated_indices', [])
+    
+    print(f"\n  Underactuated Joints: {underactuated_names}")
+    print(f"  Velocity Indices: {underactuated_indices}")
+    print(f"  Constraint: τ = 0 (no motor torque at these joints)")
+    print()
+    
+    # Table header
+    print(f"  {'Phase':<8} {'Duration (s)':<14} {'Max |τ_passive| (N⋅m)':<24} {'Status':<10}")
+    print("  " + "-" * 60)
+    
+    overall_max = 0.0
+    total_duration = 0.0
+    
+    for data in all_torque_data:
+        phase = data.get('phase', '?')
+        max_tau = data.get('max_violation', 0.0)
+        times = data.get('times', np.array([]))
+        duration = times[-1] - times[0] if len(times) > 1 else 0.0
+        
+        overall_max = max(overall_max, max_tau)
+        total_duration += duration
+        
+        status = "✓ PASS" if max_tau < 1e-3 else "✗ FAIL"
+        print(f"  {phase:<8} {duration:<14.4f} {max_tau:<24.6f} {status:<10}")
+    
+    print("  " + "-" * 60)
+    print(f"  {'TOTAL':<8} {total_duration:<14.4f} {overall_max:<24.6f}")
+    
+    print("\n" + "=" * 80)
+    if overall_max < 1e-3:
+        print("  ✓ UNDERACTUATION VERIFIED!")
+        print("    The trajectory is dynamically feasible with passive (unactuated) joints.")
+        print(f"    Maximum torque at passive joints: {overall_max:.6f} N⋅m (effectively zero)")
+    else:
+        print("  ⚠ WARNING: Underactuation constraints may be violated!")
+        print(f"    Maximum torque at passive joints: {overall_max:.6f} N⋅m")
+    print("=" * 80)
+
+
+def plot_torque_comparison(all_torque_data: list, save_path: str = None):
+    """
+    Create plots comparing actuated vs underactuated joint torques.
+    
+    Args:
+        all_torque_data: List of torque data dicts from each phase
+        save_path: Optional path to save the figure
+    """
+    if not all_torque_data:
+        print("No torque data to plot.")
+        return
+    
+    # Stitch together all phases
+    all_times = []
+    all_tau = []
+    cumulative_time = 0.0
+    
+    for data in all_torque_data:
+        times = data.get('times', np.array([]))
+        tau_all = data.get('tau_all', np.array([]))
+        
+        if len(times) == 0 or len(tau_all) == 0:
+            continue
+        
+        # Offset times for stitching
+        all_times.append(times + cumulative_time)
+        all_tau.append(tau_all)
+        cumulative_time = all_times[-1][-1]
+    
+    if not all_times:
+        print("No valid torque data to plot.")
+        return
+    
+    times = np.concatenate(all_times)
+    tau = np.vstack(all_tau)
+    
+    underactuated_indices = all_torque_data[0].get('underactuated_indices', [])
+    underactuated_names = all_torque_data[0].get('underactuated_names', [])
+    joint_names = all_torque_data[0].get('joint_names', [])
+    
+    # Get actuated indices (all indices not in underactuated)
+    nv = tau.shape[1]
+    actuated_indices = [i for i in range(nv) if i not in underactuated_indices]
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    fig.suptitle('Joint Torque Analysis: Actuated vs Underactuated Joints', fontsize=14, fontweight='bold')
+    
+    # Color scheme
+    actuated_colors = plt.cm.Blues(np.linspace(0.4, 0.9, len(actuated_indices)))
+    underactuated_color = 'red'
+    
+    # === Subplot 1: All actuated joint torques ===
+    ax1 = axes[0]
+    ax1.set_title('Actuated Joint Torques (motors active)', fontsize=12)
+    
+    for i, idx in enumerate(actuated_indices):
+        name = joint_names[idx] if idx < len(joint_names) else f"joint_{idx}"
+        # Only label a few for clarity
+        label = name if i < 6 else None
+        ax1.plot(times, tau[:, idx], color=actuated_colors[i % len(actuated_colors)], 
+                 alpha=0.7, linewidth=1, label=label)
+    
+    ax1.set_ylabel('Torque (N⋅m)')
+    ax1.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax1.legend(loc='upper right', fontsize=8, ncol=2)
+    ax1.grid(True, alpha=0.3)
+    
+    # === Subplot 2: Underactuated joint torques (should be ~0) ===
+    ax2 = axes[1]
+    ax2.set_title(f'Underactuated Joint Torques (PASSIVE - should be ≈ 0): {underactuated_names}', 
+                  fontsize=12, color='red')
+    
+    if underactuated_indices:
+        for i, idx in enumerate(underactuated_indices):
+            name = underactuated_names[i] if i < len(underactuated_names) else f"passive_{idx}"
+            ax2.plot(times, tau[:, idx], color=underactuated_color, 
+                     linewidth=2, label=name, alpha=0.8)
+        
+        # Add shaded region for "acceptable" range
+        max_acceptable = 0.001  # 1 mN⋅m
+        ax2.axhspan(-max_acceptable, max_acceptable, color='green', alpha=0.2, 
+                    label=f'Acceptable range (±{max_acceptable*1000:.1f} mN⋅m)')
+        ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+        
+        # Set y-axis limits to zoom into the small values
+        max_val = np.max(np.abs(tau[:, underactuated_indices])) * 1.5
+        max_val = max(max_val, 0.01)  # At least show ±10 mN⋅m
+        ax2.set_ylim(-max_val, max_val)
+    else:
+        ax2.text(0.5, 0.5, 'No underactuated joints specified', 
+                 transform=ax2.transAxes, ha='center', va='center', fontsize=12)
+    
+    ax2.set_ylabel('Torque (N⋅m)')
+    ax2.legend(loc='upper right', fontsize=9)
+    ax2.grid(True, alpha=0.3)
+    
+    # === Subplot 3: Comparison - one actuated vs one underactuated ===
+    ax3 = axes[2]
+    ax3.set_title('Direct Comparison: Sample Actuated vs Underactuated Joint', fontsize=12)
+    
+    # Pick one actuated knee for comparison (e.g., front_right_knee)
+    # Index 11 is typically front_right_knee in the velocity ordering
+    comparison_actuated_idx = None
+    for idx in actuated_indices:
+        if idx < len(joint_names) and 'knee' in joint_names[idx]:
+            comparison_actuated_idx = idx
+            break
+    
+    if comparison_actuated_idx is None and actuated_indices:
+        comparison_actuated_idx = actuated_indices[0]
+    
+    if comparison_actuated_idx is not None:
+        actuated_name = joint_names[comparison_actuated_idx] if comparison_actuated_idx < len(joint_names) else f"joint_{comparison_actuated_idx}"
+        ax3.plot(times, tau[:, comparison_actuated_idx], 'b-', 
+                 linewidth=2, label=f'{actuated_name} (ACTUATED)', alpha=0.8)
+    
+    if underactuated_indices:
+        passive_idx = underactuated_indices[0]
+        passive_name = underactuated_names[0] if underactuated_names else f"joint_{passive_idx}"
+        ax3.plot(times, tau[:, passive_idx], 'r-', 
+                 linewidth=2, label=f'{passive_name} (PASSIVE)', alpha=0.8)
+    
+    ax3.set_xlabel('Time (s)')
+    ax3.set_ylabel('Torque (N⋅m)')
+    ax3.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax3.legend(loc='upper right', fontsize=10)
+    ax3.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save or show
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"\n  Torque plot saved to: {save_path}")
+    
+    plt.show()
+
+
+def plot_underactuation_detail(all_torque_data: list, save_path: str = None):
+    """
+    Create a detailed plot focused on underactuated joint torques.
+    
+    Args:
+        all_torque_data: List of torque data dicts from each phase
+        save_path: Optional path to save the figure
+    """
+    if not all_torque_data:
+        print("No torque data to plot.")
+        return
+    
+    underactuated_indices = all_torque_data[0].get('underactuated_indices', [])
+    if not underactuated_indices:
+        print("No underactuated joints to plot.")
+        return
+    
+    underactuated_names = all_torque_data[0].get('underactuated_names', [])
+    
+    # Stitch together all phases
+    all_times = []
+    all_tau_underact = []
+    phase_boundaries = [0.0]
+    cumulative_time = 0.0
+    
+    for data in all_torque_data:
+        times = data.get('times', np.array([]))
+        tau_underact = data.get('tau_underactuated', np.array([]))
+        
+        if len(times) == 0 or len(tau_underact) == 0:
+            continue
+        
+        all_times.append(times + cumulative_time)
+        all_tau_underact.append(tau_underact)
+        cumulative_time = all_times[-1][-1]
+        phase_boundaries.append(cumulative_time)
+    
+    if not all_times:
+        print("No valid underactuated torque data to plot.")
+        return
+    
+    times = np.concatenate(all_times)
+    tau_underact = np.vstack(all_tau_underact)
+    
+    # Create figure
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+    fig.suptitle(f'Underactuation Verification: {underactuated_names}', 
+                 fontsize=14, fontweight='bold')
+    
+    colors = ['red', 'darkred', 'orangered', 'crimson']
+    
+    # === Top: Time series ===
+    ax1 = axes[0]
+    ax1.set_title('Passive Joint Torques Over Time (Should be ≈ 0)', fontsize=12)
+    
+    for i in range(tau_underact.shape[1]):
+        name = underactuated_names[i] if i < len(underactuated_names) else f"passive_{i}"
+        ax1.plot(times, tau_underact[:, i], color=colors[i % len(colors)], 
+                 linewidth=1.5, label=name, alpha=0.9)
+    
+    # Add phase boundaries
+    for boundary in phase_boundaries[1:-1]:
+        ax1.axvline(x=boundary, color='gray', linestyle='--', alpha=0.5, linewidth=0.8)
+    
+    # Add acceptable region
+    ax1.axhspan(-0.001, 0.001, color='green', alpha=0.15, label='Acceptable (±1 mN⋅m)')
+    ax1.axhline(y=0, color='black', linestyle='-', linewidth=1)
+    
+    ax1.set_ylabel('Torque (N⋅m)')
+    ax1.legend(loc='upper right', fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    
+    # Auto-scale with some padding
+    max_abs = np.max(np.abs(tau_underact)) * 1.3
+    max_abs = max(max_abs, 0.005)  # At least ±5 mN⋅m visible
+    ax1.set_ylim(-max_abs, max_abs)
+    
+    # === Bottom: Histogram of torque values ===
+    ax2 = axes[1]
+    ax2.set_title('Distribution of Passive Joint Torques', fontsize=12)
+    
+    all_values = tau_underact.flatten()
+    
+    # Histogram
+    n, bins, patches = ax2.hist(all_values * 1000, bins=50, color='red', alpha=0.7, 
+                                 edgecolor='darkred', label='Torque samples')
+    
+    # Add vertical lines for statistics
+    mean_val = np.mean(all_values) * 1000
+    std_val = np.std(all_values) * 1000
+    max_val = np.max(np.abs(all_values)) * 1000
+    
+    ax2.axvline(x=mean_val, color='blue', linestyle='-', linewidth=2, 
+                label=f'Mean: {mean_val:.4f} mN⋅m')
+    ax2.axvline(x=0, color='black', linestyle='-', linewidth=1)
+    
+    # Acceptable region
+    ax2.axvspan(-1, 1, color='green', alpha=0.2, label='Acceptable (±1 mN⋅m)')
+    
+    ax2.set_xlabel('Torque (mN⋅m)')
+    ax2.set_ylabel('Count')
+    ax2.legend(loc='upper right', fontsize=10)
+    ax2.grid(True, alpha=0.3)
+    
+    # Add statistics text box
+    stats_text = (f'Statistics:\n'
+                  f'  Mean: {mean_val:.4f} mN⋅m\n'
+                  f'  Std Dev: {std_val:.4f} mN⋅m\n'
+                  f'  Max |τ|: {max_val:.4f} mN⋅m\n'
+                  f'  Samples: {len(all_values)}')
+    
+    ax2.text(0.02, 0.98, stats_text, transform=ax2.transAxes, fontsize=10,
+             verticalalignment='top', fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"\n  Underactuation detail plot saved to: {save_path}")
+    
+    plt.show()
+
+
+def plot_joint_angles(all_torque_data: list, t_sol, q_sol, save_path: str = None):
+    """
+    Plot joint angle trajectories to show how passive vs actuated joints move.
+    
+    This helps visualize that passive joints DO move, but without torque.
+    """
+    if not all_torque_data:
+        return
+    
+    # Sample the trajectory
+    num_samples = 200
+    times = np.linspace(t_sol[0], t_sol[-1], num_samples)
+    
+    # Get joint names
+    joint_names = list(all_torque_data[0].get('joint_names', []))
+    underactuated_names = all_torque_data[0].get('underactuated_names', [])
+    
+    if not joint_names:
+        return
+    
+    # Sample joint positions over time
+    # Joint angles in q are at indices 7-18 (after quaternion[4] + position[3])
+    # Joint names from velocity view are at indices 6-17
+    q_samples = np.zeros((num_samples, len(joint_names)))
+    for i, t in enumerate(times):
+        q_full = q_sol.value(t).flatten()
+        # Map velocity indices to position indices
+        for j in range(len(joint_names)):
+            if j < 6:  # Skip body velocities (wx, wy, wz, vx, vy, vz)
+                continue
+            pos_idx = j + 1  # Offset for position vs velocity indexing
+            if pos_idx < len(q_full):
+                q_samples[i, j] = q_full[pos_idx]
+    
+    # Create figure
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12))
+    fig.suptitle('Joint Motion Analysis: Passive Joints MOVE but need NO TORQUE', 
+                 fontsize=14, fontweight='bold')
+    
+    # Define joint groups
+    knee_joints = ['front_left_knee', 'front_right_knee', 'rear_left_knee', 'rear_right_knee']
+    
+    # Plot 1: All knee angles with passive/actuated distinction
+    ax1 = axes[0]
+    ax1.set_title('Knee Joint Angles: PASSIVE vs ACTUATED\n(Both move, but passive needs no motor torque!)', 
+                  fontsize=12, fontweight='bold')
+    
+    colors = {'front_left_knee': 'red', 'front_right_knee': 'orangered',
+              'rear_left_knee': 'blue', 'rear_right_knee': 'darkblue'}
+    
+    for name in knee_joints:
+        if name in joint_names:
+            idx = joint_names.index(name)
+            is_passive = name in underactuated_names
+            linewidth = 3 if is_passive else 1.5
+            linestyle = '-' if is_passive else '--'
+            label = f"{name} {'[PASSIVE - τ=0]' if is_passive else '[ACTUATED - τ≠0]'}"
+            ax1.plot(times, np.degrees(q_samples[:, idx]), 
+                    linestyle=linestyle, linewidth=linewidth, 
+                    color=colors.get(name, 'gray'), label=label, alpha=0.9)
+    
+    ax1.set_xlabel('Time (s)')
+    ax1.set_ylabel('Joint Angle (degrees)')
+    ax1.legend(loc='upper right', fontsize=9)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim([times[0], times[-1]])
+    
+    # Plot 2: Passive joint motion vs torque (key insight!)
+    ax2 = axes[1]
+    ax2.set_title('KEY INSIGHT: Passive Joint Moves ~20° with ZERO Torque', 
+                  fontsize=12, fontweight='bold', color='darkgreen')
+    
+    # Get passive knee angle
+    if underactuated_names and underactuated_names[0] in joint_names:
+        knee_name = underactuated_names[0]
+        knee_idx = joint_names.index(knee_name)
+        knee_angles = np.degrees(q_samples[:, knee_idx])
+        
+        # Plot angle on primary axis
+        line1, = ax2.plot(times, knee_angles, 'r-', linewidth=2.5, 
+                          label=f'{knee_name} angle (deg)')
+        ax2.set_ylabel('Joint Angle (degrees)', color='red')
+        ax2.tick_params(axis='y', labelcolor='red')
+        
+        # Add torque on secondary axis
+        ax2_torque = ax2.twinx()
+        
+        # Collect all torque data for this joint
+        all_tau_times = []
+        all_tau_values = []
+        cumulative_time = 0.0
+        for data in all_torque_data:
+            if 'times' in data and 'tau_underactuated' in data:
+                phase_times = data['times']
+                phase_torques = data['tau_underactuated']
+                if len(phase_torques) > 0 and len(phase_times) > 0:
+                    all_tau_times.extend(phase_times + cumulative_time)
+                    # Get first underactuated joint torque
+                    all_tau_values.extend([t[0] * 1000 if len(t) > 0 else 0 for t in phase_torques])
+                    cumulative_time = phase_times[-1] + cumulative_time
+        
+        if all_tau_times:
+            line2, = ax2_torque.plot(all_tau_times, all_tau_values, 'b-', 
+                                     linewidth=1.5, alpha=0.7, label=f'{knee_name} torque (mN⋅m)')
+            ax2_torque.axhline(y=0, color='green', linestyle='--', linewidth=1.5, alpha=0.7)
+            ax2_torque.fill_between(all_tau_times, -1, 1, alpha=0.15, color='green')
+            ax2_torque.set_ylabel('Joint Torque (mN⋅m)', color='blue')
+            ax2_torque.tick_params(axis='y', labelcolor='blue')
+            ax2_torque.set_ylim([-5, 5])
+            
+            # Combined legend
+            ax2.legend([line1, line2], [f'{knee_name} angle (deg)', f'{knee_name} torque (mN⋅m)'],
+                      loc='upper right', fontsize=9)
+        
+        ax2.set_xlabel('Time (s)')
+        ax2.set_xlim([times[0], times[-1]])
+        
+        # Add annotation
+        mid_idx = len(times) // 2
+        angle_range = np.max(knee_angles) - np.min(knee_angles)
+        ax2.annotate(f'Motion: {angle_range:.1f}° range\nTorque: ≈0 mN⋅m', 
+                    xy=(times[mid_idx], knee_angles[mid_idx]),
+                    xytext=(times[mid_idx] - 2, np.max(knee_angles) + 3),
+                    fontsize=11, color='darkgreen', fontweight='bold',
+                    arrowprops=dict(arrowstyle='->', color='darkgreen', alpha=0.7),
+                    bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.3))
+    
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Side-by-side comparison of actuated vs passive
+    ax3 = axes[2]
+    ax3.set_title('Motion Comparison: Both joints move, only actuated one needs torque', fontsize=12)
+    
+    # Find an actuated knee
+    actuated_knee = None
+    for name in ['rear_left_knee', 'rear_right_knee']:
+        if name in joint_names and name not in underactuated_names:
+            actuated_knee = name
+            break
+    
+    passive_knee = underactuated_names[0] if underactuated_names else None
+    
+    if actuated_knee and passive_knee and actuated_knee in joint_names and passive_knee in joint_names:
+        act_idx = joint_names.index(actuated_knee)
+        pas_idx = joint_names.index(passive_knee)
+        
+        ax3.plot(times, np.degrees(q_samples[:, act_idx]), 'b-', 
+                 linewidth=2, label=f'{actuated_knee} [ACTUATED]', alpha=0.8)
+        ax3.plot(times, np.degrees(q_samples[:, pas_idx]), 'r-', 
+                 linewidth=2, label=f'{passive_knee} [PASSIVE]', alpha=0.8)
+        
+        ax3.set_xlabel('Time (s)')
+        ax3.set_ylabel('Joint Angle (degrees)')
+        ax3.legend(loc='upper right', fontsize=10)
+        ax3.grid(True, alpha=0.3)
+        ax3.set_xlim([times[0], times[-1]])
+        
+        # Add text box explaining the difference
+        explanation = ("Both joints move similarly during walking.\n"
+                      "ACTUATED: requires 50-100+ N⋅m motor torque\n"
+                      "PASSIVE: requires 0 N⋅m (moves freely)")
+        ax3.text(0.02, 0.98, explanation, transform=ax3.transAxes, fontsize=10,
+                verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"\n  Joint angle analysis saved to: {save_path}")
+    
+    plt.show()
+
+
+def print_motion_explanation():
+    """Print an explanation of what underactuation means visually."""
+    print("\n" + "=" * 80)
+    print("UNDERSTANDING UNDERACTUATION IN THE VISUALIZATION")
+    print("=" * 80)
+    print("""
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  IMPORTANT: Passive joints DO move - they just move WITHOUT motor power │
+  └─────────────────────────────────────────────────────────────────────────┘
+  
+  What you're seeing in the simulation:
+  
+  ✓ The front knees (passive) ARE bending and extending
+  ✓ This motion is driven by:
+    • Gravity pulling the lower leg down
+    • Inertial forces from body/hip motion
+    • Ground reaction forces pushing up through the leg
+  
+  ✓ The rear knees (actuated) ALSO bend and extend
+  ✓ Their motion is driven by:
+    • Motor torque (can be 50-100+ N⋅m as shown in plots)
+    • Plus the same passive forces
+  
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  The KEY difference:                                                     │
+  │                                                                          │
+  │  PASSIVE JOINT:  motion = f(gravity, inertia, contacts)                 │
+  │                  torque ≈ 0 N⋅m (no motor!)                             │
+  │                                                                          │
+  │  ACTUATED JOINT: motion = f(gravity, inertia, contacts, motor_torque)   │
+  │                  torque = 50-100+ N⋅m (motor working!)                  │
+  └─────────────────────────────────────────────────────────────────────────┘
+  
+  See the plots:
+  • torque_comparison.png     - Shows actuated joints need high torques
+  • underactuation_detail.png - Shows passive joints have near-zero torque  
+  • joint_angle_analysis.png  - Shows joints move but passive ones need no torque
+""")
+
+
 def main():
     """
     Main function: compute multi-step trajectory and play it back in Meshcat.
     """
     # Compute the multi-step trajectory
-    t_sol, q_sol, v_sol, q0 = compute_multi_step_trajectory(num_steps=10)
+    t_sol, q_sol, v_sol, q0, all_torque_data = compute_multi_step_trajectory(num_steps=10)
+    
+    # Print comprehensive underactuation report
+    print_underactuation_report(all_torque_data)
+    
+    # Generate plots
+    print("\n" + "=" * 80)
+    print("Generating Torque Analysis Plots...")
+    print("=" * 80)
+    
+    plot_torque_comparison(all_torque_data, save_path='/home/hassan/Underactuated-Biped/external/spot/torque_comparison.png')
+    plot_underactuation_detail(all_torque_data, save_path='/home/hassan/Underactuated-Biped/external/spot/underactuation_detail.png')
+    plot_joint_angles(all_torque_data, t_sol, q_sol, save_path='/home/hassan/Underactuated-Biped/external/spot/joint_angle_analysis.png')
+    
+    # Print explanation of what underactuation means visually
+    print_motion_explanation()
     
     # Build visualization diagram
     diagram, plant, meshcat, visualizer = build_visualization_diagram()

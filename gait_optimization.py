@@ -37,6 +37,11 @@ from underactuated.multibody import MakePidStateProjectionMatrix
 
 from spot_ik_helpers import SpotStickFigure
 
+## Configuration for underactuation
+# Specify which joints should be treated as unactuated (zero torque constraint)
+UNDERACTUATED_JOINT_NAMES = ["front_left_knee", "front_right_knee", "rear_left_knee", "rear_right_knee"]  # All 4 knees
+# Set to empty list to disable underactuation constraints
+
 ## Optimization for one or more foot steps
 # We formulate a QP that computes trajectories for all joint angles, from a start to an end footstep configuration. 
 # We support swinging one or more feet simultaneously (e.g., diagonal pairs for trot gait).
@@ -46,6 +51,44 @@ def autoDiffArrayEqual(a, b):
     return np.array_equal(a, b) and np.array_equal(
         ExtractGradient(a), ExtractGradient(b)
     )
+
+def get_underactuated_joint_indices(plant, spot, underactuated_joint_names):
+    """
+    Find the velocity indices for joints that should be treated as unactuated.
+    
+    Args:
+        plant: MultibodyPlant instance
+        spot: Model instance for Spot
+        underactuated_joint_names: List of joint names to treat as unactuated
+    
+    Returns:
+        underactuated_indices: List of velocity indices for the unactuated joints
+    """
+    underactuated_indices = []
+    
+    if not underactuated_joint_names:
+        return underactuated_indices
+    
+    # Iterate through all joints in the model
+    for joint_index in plant.GetJointIndices(spot):
+        joint = plant.get_joint(joint_index)
+        joint_name = joint.name()
+        
+        if joint_name in underactuated_joint_names:
+            # Get the velocity start index for this joint
+            velocity_start = joint.velocity_start()
+            num_velocities = joint.num_velocities()
+            
+            # Add all velocity indices for this joint
+            for i in range(num_velocities):
+                underactuated_indices.append(velocity_start + i)
+            
+            print(f"  Underactuated joint: '{joint_name}' -> velocity indices {list(range(velocity_start, velocity_start + num_velocities))}")
+    
+    if underactuated_indices:
+        print(f"  Total underactuated DOFs: {len(underactuated_indices)}")
+    
+    return underactuated_indices
 
 def gait_optimization(plant, plant_context, spot, next_foot, swing_feet_indices, box_height):
     """
@@ -84,6 +127,13 @@ def gait_optimization(plant, plant_context, spot, next_foot, swing_feet_indices,
         plant.GetFrameByName("front_right_foot_center"),
         plant.GetFrameByName("rear_left_foot_center"),
         plant.GetFrameByName("rear_right_foot_center"),
+    ]
+    # Foot frame names for use with AutoDiff plant
+    foot_frame_names = [
+        "front_left_foot_center",
+        "front_right_foot_center",
+        "rear_left_foot_center",
+        "rear_right_foot_center",
     ]
 
     # SETUP
@@ -157,6 +207,16 @@ def gait_optimization(plant, plant_context, spot, next_foot, swing_feet_indices,
     # Joint positions and velocities
     nq = plant.num_positions()
     nv = plant.num_velocities()
+    
+    # Identify underactuated joints
+    print("\n  Checking for underactuated joints...")
+    underactuated_indices = get_underactuated_joint_indices(plant, spot, UNDERACTUATED_JOINT_NAMES)
+    if not underactuated_indices:
+        print("  No underactuated joints specified - all joints are actuated")
+    
+    # Create autodiff contexts for inverse dynamics (if underactuation is enabled)
+    if underactuated_indices:
+        ad_inv_dyn_context = [ad_plant.CreateDefaultContext() for i in range(N - 1)]
     q = prog.NewContinuousVariables(nq, N, "q")
     v = prog.NewContinuousVariables(nv, N, "v")
     q_view = PositionView(q)
@@ -417,6 +477,148 @@ def gait_optimization(plant, plant_context, spot, next_foot, swing_feet_indices,
             vars=np.concatenate((q[:, n], v[:, n], com[:, n], H[:, n])),
         )
 
+    # Underactuation constraints (zero torque on specified joints)
+    if underactuated_indices:
+        print(f"  Adding underactuation constraints for {len(underactuated_indices)} DOFs...")
+        
+        def underactuated_torque_constraint(vars, context_index):
+            """
+            Compute joint torques via inverse dynamics and return torques 
+            at underactuated joints (which should be constrained to zero).
+            
+            Args:
+                vars: Concatenated vector of [h, q, v, q_next, v_next, contact_forces]
+                context_index: Time step index
+            
+            Returns:
+                tau_underactuated: Torques at underactuated joints
+            """
+            # Split variables: [h, q_now, v_now, q_next, v_next, contact_forces]
+            # Use explicit indexing instead of np.split
+            idx = 0
+            h_val = vars[idx:idx+1]  # Shape (1,)
+            idx += 1
+            q_now = vars[idx:idx+nq]  # Shape (nq,)
+            idx += nq
+            v_now = vars[idx:idx+nv]  # Shape (nv,)
+            idx += nv
+            q_next = vars[idx:idx+nq]  # Shape (nq,)
+            idx += nq
+            v_next = vars[idx:idx+nv]  # Shape (nv,)
+            idx += nv
+            contact_forces_flat = vars[idx:]  # Shape (12,) = 4 feet * 3D force
+            contact_forces = contact_forces_flat.reshape((4, 3))  # 4 feet x 3D force
+            
+            h_val = h_val[0]  # Extract scalar from array
+            
+            # Compute acceleration using finite difference
+            vdot = (v_next - v_now) / h_val
+            
+            if isinstance(vars[0], AutoDiffXd):
+                # AutoDiff path
+                # MultibodyForces doesn't support AutoDiff, so we compute torques differently:
+                # tau = M(q)*vdot + C(q,v) - J^T*F_contact
+                ctx = ad_inv_dyn_context[context_index]
+                
+                # Set state
+                if not autoDiffArrayEqual(q_now, ad_plant.GetPositions(ctx)):
+                    ad_plant.SetPositions(ctx, q_now)
+                if not autoDiffArrayEqual(v_now, ad_plant.GetVelocities(ctx)):
+                    ad_plant.SetVelocities(ctx, v_now)
+                
+                # Compute inverse dynamics without external forces
+                # CalcInverseDynamics computes the torques needed for the given acceleration
+                # We'll compute it and then subtract the contact force contribution
+                M = ad_plant.CalcMassMatrixViaInverseDynamics(ctx)
+                Cv = ad_plant.CalcBiasTerm(ctx)  # Coriolis + gravity
+                tau_no_contact = M @ vdot + Cv
+                
+                # Now subtract the effect of contact forces: tau_contact = sum_i J_i^T * F_i
+                # Initialize tau_contact as None, then accumulate to preserve AutoDiff type
+                tau_contact = None
+                for foot_idx in range(4):
+                    F_W = contact_forces[foot_idx, :]  # Force in world frame
+                    
+                    # Get the AutoDiff version of foot frame
+                    ad_foot_frame = ad_plant.GetFrameByName(foot_frame_names[foot_idx])
+                    
+                    # Get Jacobian for this foot frame
+                    J_WF = ad_plant.CalcJacobianTranslationalVelocity(
+                        ctx,
+                        JacobianWrtVariable.kV,
+                        ad_foot_frame,
+                        [0, 0, 0],
+                        ad_plant.world_frame(),
+                        ad_plant.world_frame()
+                    )
+                    
+                    # Add J^T * F to contact torques
+                    JT_F = J_WF.T @ F_W
+                    if tau_contact is None:
+                        tau_contact = JT_F
+                    else:
+                        tau_contact = tau_contact + JT_F
+                
+                # Total torque = internal torques - contact torques
+                # (contact forces reduce the required joint torques)
+                tau_full = tau_no_contact - tau_contact
+                
+            else:
+                # Non-AutoDiff path (for initial guess evaluation)
+                # Use the same Jacobian-based approach for consistency
+                ctx = context[context_index]
+                
+                if not np.array_equal(q_now, plant.GetPositions(ctx)):
+                    plant.SetPositions(ctx, q_now)
+                if not np.array_equal(v_now, plant.GetVelocities(ctx)):
+                    plant.SetVelocities(ctx, v_now)
+                
+                # Compute M*vdot + C(q,v) without external forces
+                M = plant.CalcMassMatrix(ctx)
+                Cv = plant.CalcBiasTerm(ctx)
+                tau_no_contact = M @ vdot + Cv
+                
+                # Subtract contact force contribution via Jacobians
+                tau_contact = np.zeros(nv)
+                for foot_idx in range(4):
+                    F_W = contact_forces[foot_idx, :]
+                    J_WF = plant.CalcJacobianTranslationalVelocity(
+                        ctx,
+                        JacobianWrtVariable.kV,
+                        foot_frame[foot_idx],
+                        [0, 0, 0],
+                        plant.world_frame(),
+                        plant.world_frame()
+                    )
+                    tau_contact += J_WF.T @ F_W
+                
+                tau_full = tau_no_contact - tau_contact
+            
+            # Extract torques at underactuated joints
+            tau_underactuated = tau_full[underactuated_indices]
+            
+            return tau_underactuated
+        
+        # Add constraint for each time step
+        for n in range(N - 1):
+            # Build variable vector: [h, q, v, q_next, v_next, contact_forces]
+            Fn = np.concatenate([contact_force[i][:, n] for i in range(4)])
+            vars_underact = np.concatenate((
+                [h[n]], 
+                q[:, n], 
+                v[:, n], 
+                q[:, n + 1], 
+                v[:, n + 1],
+                Fn
+            ))
+            
+            prog.AddConstraint(
+                partial(underactuated_torque_constraint, context_index=n),
+                lb=np.zeros(len(underactuated_indices)),
+                ub=np.zeros(len(underactuated_indices)),
+                vars=vars_underact,
+            )
+
     # Kinematic constraints
     def fixed_position_constraint(vars, context_index, frame):
         q, qn = np.split(vars, [nq])
@@ -514,5 +716,80 @@ def gait_optimization(plant, plant_context, spot, next_foot, swing_feet_indices,
     t_sol = np.cumsum(np.concatenate(([0], result.GetSolution(h))))
     q_sol = PiecewisePolynomial.FirstOrderHold(t_sol, result.GetSolution(q))
     v_sol = PiecewisePolynomial.FirstOrderHold(t_sol, result.GetSolution(v))
+    
+    # Compute full torque profile for all joints at all time steps
+    # This is used for visualization and verification
+    torque_data = {
+        'times': [],
+        'tau_all': [],  # All joint torques at each time step
+        'tau_underactuated': [],  # Underactuated joint torques
+        'underactuated_indices': underactuated_indices,
+        'underactuated_names': UNDERACTUATED_JOINT_NAMES.copy(),
+        'joint_names': plant.GetVelocityNames(spot, always_add_suffix=False),
+        'max_violation': 0.0,
+    }
+    
+    if result.is_success():
+        print("\n  Computing full torque profile...")
+        
+        for n in range(N - 1):
+            # Get solution values
+            h_val = result.GetSolution(h[n])
+            q_now = result.GetSolution(q[:, n])
+            v_now = result.GetSolution(v[:, n])
+            q_next = result.GetSolution(q[:, n + 1])
+            v_next = result.GetSolution(v[:, n + 1])
+            
+            # Compute acceleration
+            vdot = (v_next - v_now) / h_val
+            
+            # Set plant state
+            plant.SetPositions(context[n], q_now)
+            plant.SetVelocities(context[n], v_now)
+            
+            # Compute M*vdot + C(q,v) without external forces
+            M = plant.CalcMassMatrix(context[n])
+            Cv = plant.CalcBiasTerm(context[n])
+            tau_no_contact = M @ vdot + Cv
+            
+            # Subtract contact force contribution via Jacobians
+            tau_contact = np.zeros(nv)
+            for foot_idx in range(4):
+                F_W = result.GetSolution(contact_force[foot_idx][:, n])
+                J_WF = plant.CalcJacobianTranslationalVelocity(
+                    context[n],
+                    JacobianWrtVariable.kV,
+                    foot_frame[foot_idx],
+                    [0, 0, 0],
+                    plant.world_frame(),
+                    plant.world_frame()
+                )
+                tau_contact += J_WF.T @ F_W
+            
+            tau_full = tau_no_contact - tau_contact
+            
+            # Store data
+            torque_data['times'].append(t_sol[n])
+            torque_data['tau_all'].append(tau_full.copy())
+            
+            if underactuated_indices:
+                tau_underact = tau_full[underactuated_indices]
+                torque_data['tau_underactuated'].append(tau_underact.copy())
+        
+        # Convert to numpy arrays
+        torque_data['times'] = np.array(torque_data['times'])
+        torque_data['tau_all'] = np.array(torque_data['tau_all'])
+        if underactuated_indices:
+            torque_data['tau_underactuated'] = np.array(torque_data['tau_underactuated'])
+            torque_data['max_violation'] = np.max(np.abs(torque_data['tau_underactuated']))
+        
+        # Print summary
+        if underactuated_indices:
+            print(f"    Underactuated joints: {UNDERACTUATED_JOINT_NAMES}")
+            print(f"    Max |tau_underactuated|: {torque_data['max_violation']:.6f} N⋅m")
+            if torque_data['max_violation'] < 1e-3:
+                print("  ✓ Underactuation constraints satisfied!")
+            else:
+                print(f"  ⚠ Warning: Underactuated torques may be violated (threshold: 1e-3)")
 
-    return t_sol, q_sol, v_sol, q_end
+    return t_sol, q_sol, v_sol, q_end, torque_data
