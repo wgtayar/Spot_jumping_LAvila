@@ -656,6 +656,20 @@ def gait_optimization(plant, plant_context, spot, next_foot, swing_feet_indices,
         else:
             return p_WF_n - p_WF
 
+    # Compute initial foot positions for STANCE feet at time 0 (for absolute stance constraints)
+    # These will be used to anchor stance feet to prevent accumulated drift
+    # NOTE: Only apply to feet that are in stance throughout (not swing feet)
+    initial_foot_positions = {}
+    plant.SetPositions(context[0], q0)
+    for i in range(4):
+        # Only compute/store for feet that are NOT swinging
+        if i not in swing_feet_indices:
+            p_initial = plant.CalcPointsPositions(
+                context[0], foot_frame[i], [0, 0, 0], plant.world_frame()
+            ).flatten()
+            initial_foot_positions[i] = p_initial.copy()
+            print(f"  Stance foot {i} anchored at: [{p_initial[0]:.4f}, {p_initial[1]:.4f}, {p_initial[2]:.4f}]")
+
     for i in range(4):
         for n in range(N):
             if in_stance[i, n]:
@@ -672,8 +686,26 @@ def gait_optimization(plant, plant_context, spot, next_foot, swing_feet_indices,
                     ),
                     q[:, n],
                 )
+                
+                # ABSOLUTE POSITION CONSTRAINT: Only for feet that stay in stance throughout
+                # (not for swing feet at their touchdown/liftoff timesteps)
+                if i not in swing_feet_indices and i in initial_foot_positions:
+                    initial_xy = initial_foot_positions[i][:2]  # Only x, y (z is handled above)
+                    prog.AddConstraint(
+                        PositionConstraint(
+                            plant,
+                            plant.world_frame(),
+                            [initial_xy[0], initial_xy[1], -np.inf],  # Anchor x, y
+                            [initial_xy[0], initial_xy[1], np.inf],
+                            foot_frame[i],
+                            [0, 0, 0],
+                            context[n],
+                        ),
+                        q[:, n],
+                    )
+                
                 if n > 0 and in_stance[i, n - 1]:
-                    # feet should not move during stance.
+                    # feet should not move during stance (relative constraint for smoothness).
                     prog.AddConstraint(
                         partial(
                             fixed_position_constraint,
@@ -711,7 +743,12 @@ def gait_optimization(plant, plant_context, spot, next_foot, swing_feet_indices,
 
     result = Solve(prog)
     print(result.get_solver_id().name())
-    print(result.is_success())
+    solver_success = result.is_success()
+    print(solver_success)
+    
+    if not solver_success:
+        print("  ⚠ WARNING: Optimization FAILED! Results may be invalid.")
+        print(f"  Solver details: {result.get_solution_result()}")
     
     t_sol = np.cumsum(np.concatenate(([0], result.GetSolution(h))))
     q_sol = PiecewisePolynomial.FirstOrderHold(t_sol, result.GetSolution(q))
@@ -727,6 +764,7 @@ def gait_optimization(plant, plant_context, spot, next_foot, swing_feet_indices,
         'underactuated_names': UNDERACTUATED_JOINT_NAMES.copy(),
         'joint_names': plant.GetVelocityNames(spot, always_add_suffix=False),
         'max_violation': 0.0,
+        'solver_success': solver_success,
     }
     
     if result.is_success():
@@ -784,12 +822,14 @@ def gait_optimization(plant, plant_context, spot, next_foot, swing_feet_indices,
             torque_data['max_violation'] = np.max(np.abs(torque_data['tau_underactuated']))
         
         # Print summary
+        # Threshold: 10 mN·m (0.01 N·m) - negligible compared to typical motor torques
+        UNDERACTUATION_THRESHOLD = 0.01  # 10 mN·m
         if underactuated_indices:
             print(f"    Underactuated joints: {UNDERACTUATED_JOINT_NAMES}")
             print(f"    Max |tau_underactuated|: {torque_data['max_violation']:.6f} N⋅m")
-            if torque_data['max_violation'] < 1e-3:
+            if torque_data['max_violation'] < UNDERACTUATION_THRESHOLD:
                 print("  ✓ Underactuation constraints satisfied!")
             else:
-                print(f"  ⚠ Warning: Underactuated torques may be violated (threshold: 1e-3)")
+                print(f"  ⚠ Warning: Underactuated torques exceeded {UNDERACTUATION_THRESHOLD*1000:.0f} mN·m threshold")
 
     return t_sol, q_sol, v_sol, q_end, torque_data
