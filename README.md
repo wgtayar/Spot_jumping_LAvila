@@ -1,14 +1,17 @@
-<h1 align="center">🌿🌿🌿 BASIL 🌿🌿🌿</h1>
+<h1 align="center">🌿🌿🌿 BASIL: Spot Submodule 🌿🌿🌿</h1>
 <h1 align="center">Better Actuation of Spot Ignited at LAU</h1>
 
 ### Quadruped Locomotion and Control Playground
 
-`BASIL` is a Drake / Python playground for experimenting with advanced control of Boston Dynamics’ Spot robot model.  
+This repository is the **Spot submodule** of the 🌿BASIL🌿 project.
+
+`BASIL / Spot` is a Drake and Python playground for experimenting with advanced control of Boston Dynamics’ Spot robot model.  
 It builds on the MIT Underactuated Robotics Spot examples and adds:
 
 - Standing PD controllers with disturbance tests  
-- Joint–space and full–state LQR regulators  
-- Kino-dynamic jumping and backflip optimization demos  
+- Joint-space and full-state LQR regulators  
+- MPC Control of Spot
+- Kino-dynamic jumping and multi-step trot demos with passive knees  
 - A clean structure for extending behaviors and controllers  
 
 All of this runs in simulation (no real robot required).
@@ -17,35 +20,39 @@ All of this runs in simulation (no real robot required).
 
 ## Quick Start
 
-### 1. Clone the Repository (with all Submodules)
+### 1. Clone the Repository (with All Submodules)
 
-This project uses Git submodules (and nested submodules inside them), so you **must** clone recursively.
+If you are using this repo standalone:
 
 ```bash
-# Example (SSH):   git@github.com:wgtayar/Spot_actually_walking.git
-
-git clone --recurse-submodules git@github.com:wgtayar/Spot_actually_walking.git basil
-cd basil
+git clone --recurse-submodules git@github.com:wgtayar/Spot_actually_walking.git basil-spot
+cd basil-spot
 ```
 
-If you prefer to keep the original folder name from the repo instead of `basil`, omit the last argument.
+If you are coming from the 🌿BASIL🌿 meta-repo, you should already be inside:
+
+```bash
+cd basil/external/spot
+```
+
+as long as you cloned 🌿BASIL🌿 with `--recurse-submodules`.
 
 ---
 
-### 2. If You Already Cloned Without Submodules
+### 2. If You Already Cloned BUT Without Submodules
 
-If you previously did a plain `git clone` and now directories like `underactuated/` are empty:
+If directories from underactuated or other externals look empty:
 
 ```bash
-cd basil    # or the directory where you cloned the repo
+# Standalone clone:
+git submodule update --init --recursive
+
+# From BASIL:
+cd basil
 git submodule update --init --recursive
 ```
 
-This will:
-
-- Initialize all top-level submodules  
-- Initialize all nested submodules inside them  
-- Checkout the exact commits expected by this project  
+This guarantees that the required underactuated code and its submodules are present.
 
 ---
 
@@ -108,56 +115,78 @@ docker compose build
 
 ### 5. Updating BASIL Later (Including Submodules)
 
-When new changes land on the remote, do:
+> Tip: You can also let Docker Compose build the image automatically the first time it runs the service.
+
+Build the image from this folder:
 
 ```bash
-cd basil
-git pull
-git submodule update --init --recursive
+docker build -t spot-sim .
 ```
 
-If you want Git to *always* recurse into submodules when you pull, you can set:
+### Option A (recommended): Run sim, then land in a shell
+
+Run the standing sim with Meshcat on port 7000. Press `Ctrl+C` to stop the sim and drop into a shell in the same container (at `/workspace/spot`). Type `exit` to leave the container.
 
 ```bash
-git config --global submodule.recurse true
+docker compose run --rm --service-ports spot-sim
 ```
 
-After that, a normal:
+Open http://localhost:7000 in your browser for Meshcat.
+
+### Option B: Keep container up in the background
 
 ```bash
-git pull
+docker compose up -d
 ```
 
-will automatically update submodules as well.
+Open http://localhost:7000 for Meshcat, then exec into the container to run scripts:
+
+```bash
+docker compose exec spot-sim bash
+```
+
+Stop everything when done:
+
+```bash
+docker compose down
+```
 
 ---
 
-## Repository Layout (High-Level)
+## Working with Branches
 
-Some of the key pieces you will find in this repo:
+If you are using Git branches to experiment with different controllers:
 
-- `spot_model.py`  
-  Minimal wrapper and helpers around the Spot MultibodyPlant / model.
+```bash
+# Standalone
+git clone --recurse-submodules git@github.com:wgtayar/Spot_actually_walking.git basil-spot
+cd basil-spot
+git checkout <branch-name>
+docker compose run --rm --service-ports spot-sim
+```
 
-- `spot_standing_sim.py`  
-  Joint-level PD controller to keep Spot standing in place, with options to inject disturbances and test robustness.
+From 🌿BASIL🌿:
 
-- `spot_lqr_standing.py` and `full_state_lqr_controller.py`  
-  LQR design and regulators around a nominal standing pose  
-  – both joint-space and full-state (floating-base) variants.
+```bash
+cd basil/external/spot
+git checkout <branch-name>
+docker compose run --rm --service-ports spot-sim
+```
 
-- `underactuated/`  
-  Git submodule containing the MIT Underactuated Robotics code and examples this project builds on.  
-  **This is why `--recurse-submodules` is required.**
+If branch changes add or remove dependencies, rebuild:
+
+```bash
+docker compose build
+```
 
 ---
 
-## Running a First Demo (Example)
+## Running a First Demo (Local Python) (NOT Recommended)
 
-Once you have Python, Drake (`pydrake`), and the usual scientific Python stack set up, you can, for example, run the standing PD demo:
+If you are not using Docker and have a Python environment set up (for example via `basil/requirements.txt`):
 
 ```bash
-cd basil
+cd basil/external/spot    # or standalone clone
 
 # Stand in place with the nominal PD controller
 python3 spot_standing_sim.py
@@ -170,24 +199,16 @@ Other scripts can be run in the same way:
 
 ```bash
 python3 spot_multi_step_playback.py
+# or any other example script, see headers and comments in the files
 ```
-
-Check the top of each file for any script-specific options or comments.
 
 ---
 
-## Notes & Best Practices
+## Notes and Best Practices
 
-- Always clone/update with `--recurse-submodules` or `git submodule update --init --recursive`.  
-- Keep your Python + Drake environment consistent with the versions expected by the `underactuated` submodule.  
-- Use Git branches if you plan to heavily modify controller gains or cost functions – it makes it easier to compare behaviors.  
-- If something looks broken after a pull, run:
-
-  ```bash
-  git submodule update --init --recursive
-  ```
-
-  to ensure all submodules are in sync.
+- Ensure both this repo and the `underactuated` dependency are initialized (`git submodule update --init --recursive` at the 🌿BASIL🌿 root is safest).  
+- Use Docker for a fully reproducible environment, or `basil/requirements.txt` for a lighter local install.  
+- Treat branches as experiments: one branch per major controller or trajectory change.  
 
 ---
 
