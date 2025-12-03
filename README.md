@@ -49,7 +49,64 @@ This will:
 
 ---
 
-### 3. Updating BASIL Later (Including Submodules)
+### 3. Docker quickstart
+
+Build the image from this folder:
+
+```bash
+docker build -t spot-sim .
+```
+
+> Tip: You can skip the manual build; `docker compose` will build the image automatically the first time it runs the service.
+
+#### Option A (recommended): Run sim, then land in a shell
+
+Run the standing sim with meshcat on port 7000. Ctrl+C stops the sim and drops you into a shell in the same container (at `/workspace/spot`). Type `exit` to leave the container.
+
+```bash
+docker compose run --rm --service-ports spot-sim
+```
+
+Open http://localhost:7000 in your browser for meshcat.
+
+#### Option B: Keep container up in the background
+
+Start the service detached:
+
+```bash
+docker compose up -d
+```
+
+Open http://localhost:7000 for meshcat, then exec into the container to run scripts:
+
+```bash
+docker compose exec spot-sim bash
+```
+
+Stop everything when done:
+
+```bash
+docker compose down
+```
+
+### 4. Working with branches
+
+The container always sees whatever branch is checked out on your host because the repo is mounted into `/workspace/spot`. Typical flow:
+
+```bash
+git clone --recurse-submodules git@github.com:wgtayar/Spot_actually_walking.git basil
+cd basil
+git checkout <branch-name>
+docker compose run --rm --service-ports spot-sim
+```
+
+If you switch branches and the dependencies change, rebuild the image:
+
+```bash
+docker compose build
+```
+
+### 5. Updating BASIL Later (Including Submodules)
 
 When new changes land on the remote, do:
 
@@ -135,60 +192,3 @@ Check the top of each file for any script-specific options or comments.
 ---
 
 *Enjoy BASIL and making Spot actually walk like a pro 🌿*
-
-## Docker quickstart
-
-Build the image from this folder:
-
-```bash
-docker build -t spot-sim .
-```
-
-> Tip: You can skip the manual build; `docker compose` will build the image automatically the first time it runs the service.
-
-### Option A (recommended): Run sim, then land in a shell
-
-Run the standing sim with meshcat on port 7000. Ctrl+C stops the sim and drops you into a shell in the same container (at `/workspace/spot`). Type `exit` to leave the container.
-
-```bash
-docker compose run --rm --service-ports spot-sim
-```
-
-Open http://localhost:7000 in your browser for meshcat.
-
-### Option B: Keep container up in the background
-
-Start the service detached:
-
-```bash
-docker compose up -d
-```
-
-Open http://localhost:7000 for meshcat, then exec into the container to run scripts:
-
-```bash
-docker compose exec spot-sim bash
-```
-
-Stop everything when done:
-
-```bash
-docker compose down
-```
-
-## Working with branches
-
-The container always sees whatever branch is checked out on your host because the repo is mounted into `/workspace/spot`. Typical flow:
-
-```bash
-git clone --recurse-submodules git@github.com:wgtayar/Spot_actually_walking.git basil
-cd basil
-git checkout <branch-name>
-docker compose run --rm --service-ports spot-sim
-```
-
-If you switch branches and the dependencies change, rebuild the image:
-
-```bash
-docker compose build
-```
